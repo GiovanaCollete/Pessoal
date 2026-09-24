@@ -1,0 +1,435 @@
+let
+    // Define o primeiro dia incluído na consulta
+    DataInicio = #date(2026, 1, 1),
+
+    // Define o primeiro dia que não será incluído
+    // Assim, a consulta considera até 31/12/2026
+    DataFimExclusivo = #date(2027, 1, 1),
+
+    // Combina todas as consultas de receita em uma única tabela
+    Source =
+        Table.Combine(
+            {BMF, BOV, BTC, CETIP, ETCR, OFF, SELIC, SPOT}
+        ),
+
+    // Define os tipos das colunas utilizadas nos filtros e cruzamentos
+    #"Tipo Inicial" =
+        Table.TransformColumnTypes(
+            Source,
+            {
+                {"Account", type text},
+                {"Exchange", type text},
+                {"InstrumentGroup", type text},
+                {"Remarks", type text},
+                {"AccountingDate", type date},
+                {"BrokerFee", type number}
+            }
+        ),
+
+    // Mantém somente os registros de 01/01/2026 até 31/12/2026
+    #"Filtro Ano 2026" =
+        Table.SelectRows(
+            #"Tipo Inicial",
+            each
+                [AccountingDate] <> null
+                and [AccountingDate] >= DataInicio
+                and [AccountingDate] < DataFimExclusivo
+        ),
+
+    // Remove registros de GFI, LEND e valores indesejados de Remarks
+    #"Filtro Principal" =
+        Table.SelectRows(
+            #"Filtro Ano 2026",
+            each
+                [ExecBroker] <> "GFI"
+                and [Exchange] <> null
+                and [Exchange] <> "LEND"
+                and not List.Contains(
+                    {
+                        "SPREAD",
+                        "Spread Rateado",
+                        "1",
+                        "CONTA ERRO OFF",
+                        "1229",
+                        "1448",
+                        "1449",
+                        "1450",
+                        "1451",
+                        "1452",
+                        "1453",
+                        "1454",
+                        "1455",
+                        "1456",
+                        "1457",
+                        "1458",
+                        "99999",
+                        "9999300"
+                    },
+                    Text.From([Remarks])
+                )
+        ),
+
+    // Remove AccountingMonth para recriá-la corretamente
+    // MissingField.Ignore evita erro caso a coluna não exista em alguma situação
+    #"Remove AccountingMonth" =
+        Table.RemoveColumns(
+            #"Filtro Principal",
+            {"AccountingMonth"},
+            MissingField.Ignore
+        ),
+
+    // Recria AccountingMonth com o primeiro dia do mês de AccountingDate
+    #"AccountingMonth Ajustado" =
+        Table.AddColumn(
+            #"Remove AccountingMonth",
+            "AccountingMonth",
+            each Date.StartOfMonth([AccountingDate]),
+            type date
+        ),
+
+    // Substitui erros da coluna TraderName por null
+    #"Erros Trader Corrigidos" =
+        Table.ReplaceErrorValues(
+            #"AccountingMonth Ajustado",
+            {{"TraderName", null}}
+        ),
+
+    // Substitui TraderName nulo ou vazio por "0"
+    #"Trader Corrigido" =
+        Table.TransformColumns(
+            #"Erros Trader Corrigidos",
+            {
+                {
+                    "TraderName",
+                    each
+                        if _ = null or Text.Trim(Text.From(_)) = ""
+                        then "0"
+                        else Text.From(_),
+                    type text
+                }
+            }
+        ),
+
+    // Substitui "ERRO E FACIL" por "TERMO" em InstrumentGroup
+    #"Instrumento Ajustado" =
+        Table.ReplaceValue(
+            #"Trader Corrigido",
+            "ERRO E FACIL",
+            "TERMO",
+            Replacer.ReplaceValue,
+            {"InstrumentGroup"}
+        ),
+
+    // Define Conta como texto na Base de Clientes
+    #"Base Clientes Tipada" =
+        Table.TransformColumnTypes(
+            #"Base de Clientes",
+            {
+                {"Conta", type text},
+                {"Grupo da Conta", type text}
+            }
+        ),
+
+    // Mantém uma única linha para cada Conta
+    // Isso evita multiplicação de linhas no cruzamento
+    BaseClientes_Deduplicado =
+        Table.Distinct(
+            #"Base Clientes Tipada",
+            {"Conta"}
+        ),
+
+    // Define os tipos utilizados no cruzamento com Produto
+    #"Produto Tipado" =
+        Table.TransformColumnTypes(
+            Produto,
+            {
+                {"Exchange", type text},
+                {"InstrumentGroup", type text},
+                {"Grup", type text},
+                {"Classific Off", type text}
+            }
+        ),
+
+    // Mantém uma única linha para cada combinação de Exchange e InstrumentGroup
+    // Isso evita multiplicação de linhas no cruzamento
+    Produto_Deduplicado =
+        Table.Distinct(
+            #"Produto Tipado",
+            {"Exchange", "InstrumentGroup"}
+        ),
+
+    // Ajusta MONTH da PTAX para o primeiro dia de cada mês
+    Ptax_Ajustado =
+        Table.TransformColumns(
+            Ptax,
+            {
+                {
+                    "MONTH",
+                    each
+                        try Date.StartOfMonth(Date.From(_))
+                        otherwise null,
+                    type date
+                }
+            }
+        ),
+
+    // Remove linhas da PTAX sem mês informado
+    #"Ptax Sem Mês Nulo" =
+        Table.SelectRows(
+            Ptax_Ajustado,
+            each [MONTH] <> null
+        ),
+
+    // Mantém uma única linha de PTAX para cada mês
+    Ptax_Deduplicado =
+        Table.Distinct(
+            #"Ptax Sem Mês Nulo",
+            {"MONTH"}
+        ),
+
+    // Cruza Account com Conta na Base de Clientes
+    #"Merge Clientes" =
+        Table.NestedJoin(
+            #"Instrumento Ajustado",
+            {"Account"},
+            BaseClientes_Deduplicado,
+            {"Conta"},
+            "Clientes",
+            JoinKind.LeftOuter
+        ),
+
+    // Expande o Grupo da Conta encontrado na Base de Clientes
+    #"Expand Clientes" =
+        Table.ExpandTableColumn(
+            #"Merge Clientes",
+            "Clientes",
+            {"Grupo da Conta"},
+            {"NovoAccountGroup"}
+        ),
+
+    // Usa o novo grupo quando encontrado
+    // Caso não encontre, mantém AccountGroupName da origem
+    #"AccountGroup Corrigido" =
+        Table.AddColumn(
+            #"Expand Clientes",
+            "AccountGroupName_New",
+            each
+                if [NovoAccountGroup] <> null
+                    and Text.Trim(Text.From([NovoAccountGroup])) <> ""
+                then [NovoAccountGroup]
+                else [AccountGroupName],
+            type text
+        ),
+
+    // Remove AccountGroupName antigo
+    #"Remove AG Antiga" =
+        Table.RemoveColumns(
+            #"AccountGroup Corrigido",
+            {"AccountGroupName"}
+        ),
+
+    // Renomeia a coluna atualizada para AccountGroupName
+    #"Rename AG" =
+        Table.RenameColumns(
+            #"Remove AG Antiga",
+            {
+                {"AccountGroupName_New", "AccountGroupName"}
+            }
+        ),
+
+    // Remove a coluna auxiliar utilizada no cruzamento
+    #"Remove Aux AG" =
+        Table.RemoveColumns(
+            #"Rename AG",
+            {"NovoAccountGroup"}
+        ),
+
+    // Cruza Exchange e InstrumentGroup com a tabela Produto
+    #"Merge Produto" =
+        Table.NestedJoin(
+            #"Remove Aux AG",
+            {"Exchange", "InstrumentGroup"},
+            Produto_Deduplicado,
+            {"Exchange", "InstrumentGroup"},
+            "Produto",
+            JoinKind.LeftOuter
+        ),
+
+    // Expande Grup e Classific Off da tabela Produto
+    #"Expand Produto" =
+        Table.ExpandTableColumn(
+            #"Merge Produto",
+            "Produto",
+            {"Grup", "Classific Off"},
+            {"NovoMarket", "NovoClassificOff"}
+        ),
+
+    // Usa o novo Market quando encontrado
+    // Caso não encontre, mantém MarketAbbreviation da origem
+    #"Market Corrigido" =
+        Table.AddColumn(
+            #"Expand Produto",
+            "MarketAbbreviation_New",
+            each
+                if [NovoMarket] <> null
+                    and Text.Trim(Text.From([NovoMarket])) <> ""
+                then [NovoMarket]
+                else [MarketAbbreviation],
+            type text
+        ),
+
+    // Remove MarketAbbreviation antigo
+    #"Remove Market Antigo" =
+        Table.RemoveColumns(
+            #"Market Corrigido",
+            {"MarketAbbreviation"}
+        ),
+
+    // Renomeia a coluna atualizada para MarketAbbreviation
+    #"Rename Market" =
+        Table.RenameColumns(
+            #"Remove Market Antigo",
+            {
+                {"MarketAbbreviation_New", "MarketAbbreviation"}
+            }
+        ),
+
+    // Remove a coluna auxiliar NovoMarket
+    #"Remove Aux Market" =
+        Table.RemoveColumns(
+            #"Rename Market",
+            {"NovoMarket"}
+        ),
+
+    // Cria CLASSIFIC OFF com a classificação encontrada na tabela Produto
+    #"Adiciona Classific Off" =
+        Table.AddColumn(
+            #"Remove Aux Market",
+            "CLASSIFIC OFF",
+            each [NovoClassificOff],
+            type text
+        ),
+
+    // Remove Asset e a coluna auxiliar NovoClassificOff
+    #"Remove Asset Antigo" =
+        Table.RemoveColumns(
+            #"Adiciona Classific Off",
+            {"Asset", "NovoClassificOff"},
+            MissingField.Ignore
+        ),
+
+    // Substitui BiTakeUp por BI em HandlingInstruction
+    #"Handling BI" =
+        Table.ReplaceValue(
+            #"Remove Asset Antigo",
+            "BiTakeUp",
+            "BI",
+            Replacer.ReplaceValue,
+            {"HandlingInstruction"}
+        ),
+
+    // Substitui DmaTakeUp por DMA em HandlingInstruction
+    #"Handling DMA" =
+        Table.ReplaceValue(
+            #"Handling BI",
+            "DmaTakeUp",
+            "DMA",
+            Replacer.ReplaceValue,
+            {"HandlingInstruction"}
+        ),
+
+    // Define BrokerFee como moeda
+    #"Tipo Final" =
+        Table.TransformColumnTypes(
+            #"Handling DMA",
+            {
+                {"BrokerFee", Currency.Type}
+            }
+        ),
+
+    // Mantém apenas registros com BrokerFee diferente de zero
+    #"Remove Zeros" =
+        Table.SelectRows(
+            #"Tipo Final",
+            each
+                [BrokerFee] <> null
+                and Number.Abs([BrokerFee]) > 0.0000001
+        ),
+
+    // Cruza AccountingMonth com MONTH da tabela PTAX
+    #"Merge Ptax" =
+        Table.NestedJoin(
+            #"Remove Zeros",
+            {"AccountingMonth"},
+            Ptax_Deduplicado,
+            {"MONTH"},
+            "PtaxInfo",
+            JoinKind.LeftOuter
+        ),
+
+    // Expande a cotação mensal encontrada
+    #"Expand Ptax" =
+        Table.ExpandTableColumn(
+            #"Merge Ptax",
+            "PtaxInfo",
+            {"FX RATE"},
+            {"FX_RATE_Mes"}
+        ),
+
+    // Calcula a receita em dólar
+    // Retorna null quando a PTAX estiver vazia ou igual a zero
+    #"Adiciona Revenue USD" =
+        Table.AddColumn(
+            #"Expand Ptax",
+            "REVENUE USD",
+            each
+                if [FX_RATE_Mes] = null or [FX_RATE_Mes] = 0
+                then null
+                else [BrokerFee] / [FX_RATE_Mes],
+            Currency.Type
+        ),
+
+    // Remove a coluna auxiliar de cotação
+    #"Remove Aux Ptax" =
+        Table.RemoveColumns(
+            #"Adiciona Revenue USD",
+            {"FX_RATE_Mes"}
+        ),
+
+    // Reorganiza as colunas na ordem final desejada
+    #"Reordenar Final" =
+        Table.ReorderColumns(
+            #"Remove Aux Ptax",
+            {
+                "Exchange",
+                "Account",
+                "AccountName",
+                "AccountGroupName",
+                "TraderName",
+                "InstrumentGroup",
+                "Symbol",
+                "HandlingInstruction",
+                "AccountingMonth",
+                "AccountingDate",
+                "ExecBroker",
+                "AssessorName",
+                "CommissionedBroker",
+                "Remarks",
+                "MarketAbbreviation",
+                "CLASSIFIC OFF",
+                "SettlementDate",
+                "TotalQuantity",
+                "ConsideredBrokerageFee",
+                "AvgPx",
+                "TradedAmount",
+                "PercentageRatio",
+                "BrokerFee",
+                "REVENUE USD"
+            },
+            MissingField.Ignore
+        )
+
+in
+    // Retorna somente os dados de 2026 já tratados
+    #"Reordenar Final"
+``
